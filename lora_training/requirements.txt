@@ -1,0 +1,20 @@
+# TripoSR base dependencies (from parent repo)
+omegaconf==2.3.0
+Pillow>=10.1.0
+einops==0.7.0
+transformers==4.35.0
+trimesh==4.0.5
+rembg
+huggingface-hub
+imageio[ffmpeg]
+
+# Rendering (step1)
+pyrender>=0.1.45
+PyOpenGL==3.1.7
+
+# Training (step3)
+lpips
+tqdm
+
+# Optional: for Chamfer distance in step4
+scipy
