@@ -24,8 +24,10 @@ import numpy as np
 import trimesh
 from PIL import Image
 
-# Must be set BEFORE importing pyrender
-os.environ["PYOPENGL_PLATFORM"] = "osmesa"
+# Must be set BEFORE importing pyrender.
+# Use EGL (GPU-accelerated headless) on Colab/Linux with a GPU.
+# Fall back to osmesa (software) only if EGL is unavailable.
+os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 import pyrender  # noqa: E402
 
 
@@ -191,6 +193,7 @@ def main():
     print(f"Found {len(glb_files)} .glb files in {args.input_dir}")
     os.makedirs(args.output_dir, exist_ok=True)
 
+    ok, failed = 0, []
     for i, fname in enumerate(glb_files):
         print(f"[{i+1}/{len(glb_files)}] {fname}")
         try:
@@ -203,10 +206,16 @@ def main():
                 n_azimuths=args.n_azimuths,
                 elevations=args.elevations,
             )
+            ok += 1
         except Exception as e:
+            import traceback
             print(f"  FAILED: {e}")
+            traceback.print_exc()
+            failed.append(fname)
 
-    print("Done.")
+    print(f"\nDone. {ok}/{len(glb_files)} rendered successfully.")
+    if failed:
+        print(f"Failed ({len(failed)}): {', '.join(failed)}")
 
 
 if __name__ == "__main__":
