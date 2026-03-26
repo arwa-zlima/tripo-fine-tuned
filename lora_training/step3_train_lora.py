@@ -220,33 +220,62 @@ def train(args):
         print("ERROR: Could not find Transformer1D module in model.")
         sys.exit(1)
 
-    # Freeze ENTIRE model first
-    for param in model.parameters():
-        param.requires_grad = False
+    # enable_lora() injects LoRA layers AND handles freezing internally:
+    # it freezes all params in the transformer then re-enables lora_ params.
+    # We call it BEFORE freezing the rest of the model so that the LoRA
+    # Linear modules exist when we do the global freeze pass below.
+    transformer.enable_lora(r=args.lora_r, alpha=args.lora_alpha,
+                            dropout=args.lora_dropout)
 
-    # Then enable LoRA (adds new trainable params)
-    transformer.enable_lora(r=args.lora_r, alpha=args.lora_alpha)
+    # Freeze every non-LoRA param across the entire model (image_tokenizer,
+    # post_processor, decoder, renderer are all frozen — only LoRA trains).
+    for name, param in model.named_parameters():
+        if "lora_" not in name:
+            param.requires_grad_(False)
 
-    # Move to device AFTER enabling LoRA so the new lora_A/lora_B
-    # parameters are included in the transfer to GPU.
+    # Move to device AFTER enabling LoRA so lora_A/lora_B tensors
+    # are included in the GPU transfer.
     model.to(device)
 
-    # Verify freeze
+    # Verify: count trainable vs total params
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in model.parameters())
-    print(f"LoRA enabled: training {trainable:,} / {total:,} params ({100*trainable/total:.2f}%)")
+    total     = sum(p.numel() for p in model.parameters())
+    if trainable == 0:
+        print("ERROR: No trainable parameters found — LoRA injection failed.")
+        sys.exit(1)
+    print(f"LoRA enabled: training {trainable:,} / {total:,} params "
+          f"({100 * trainable / total:.3f}%)")
 
     # ── 3. Dataset & DataLoader ───────────────────────────────────────────
     train_dir = os.path.join(args.data_dir, "train")
     if not os.path.isdir(train_dir):
-        # Fallback: data_dir itself has object subdirectories (no train/val split)
+        # Fallback: data_dir itself has per-object subdirectories (no split)
+        print(f"No train/ subdir in {args.data_dir} — using root as train dir.")
         train_dir = args.data_dir
 
+    val_dir = os.path.join(args.data_dir, "val")
+    has_val = os.path.isdir(val_dir)
+
     dataset = MultiViewDataset(train_dir, image_size=args.image_size)
+    if len(dataset) == 0:
+        print(f"ERROR: No objects with >=2 views found in {train_dir}.")
+        print("Check that step2_preprocess.py ran and produced per-object subdirs.")
+        sys.exit(1)
+
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=0, drop_last=True,
     )
+
+    val_loader = None
+    if has_val:
+        val_dataset = MultiViewDataset(val_dir, image_size=args.image_size)
+        if len(val_dataset) > 0:
+            val_loader = torch.utils.data.DataLoader(
+                val_dataset, batch_size=args.batch_size, shuffle=False,
+                num_workers=0, drop_last=False,
+            )
+            print(f"Val set: {len(val_dataset)} objects")
 
     # ── 4. Optimizer ──────────────────────────────────────────────────────
     lora_params = [p for p in model.parameters() if p.requires_grad]
@@ -357,15 +386,61 @@ def train(args):
             pbar.set_postfix(loss=f"{loss_val:.4f}", lr=f"{scheduler.get_last_lr()[0]:.2e}", dt=f"{dt:.1f}s")
 
         avg_loss = sum(epoch_losses) / len(epoch_losses)
-        print(f"Epoch {epoch+1}/{args.epochs}  avg_loss={avg_loss:.5f}")
+        print(f"Epoch {epoch+1}/{args.epochs}  train_loss={avg_loss:.5f}", end="")
 
-        # Save best adapter
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        # ── Validation loop ───────────────────────────────────────────────
+        val_loss = None
+        if val_loader is not None:
+            model.eval()
+            val_losses = []
+            with torch.no_grad():
+                for val_batch in val_loader:
+                    v_input  = val_batch["input_image"]
+                    v_target = val_batch["target_image"].to(device)
+                    v_elev   = val_batch["target_elevation"]
+                    v_azim   = val_batch["target_azimuth"]
+                    v_dist   = val_batch["target_distance"]
+                    vB = v_input.shape[0]
+                    pil_val = [
+                        Image.fromarray(
+                            (v_input[i].numpy() * 255).astype(np.uint8)
+                        )
+                        for i in range(vB)
+                    ]
+                    v_codes = model(pil_val, device)
+                    vl = torch.tensor(0.0, device=device)
+                    for i in range(vB):
+                        ro, rd = get_rays_for_view(
+                            v_elev[i].item(), v_azim[i].item(),
+                            v_dist[i].item(), fovy_deg,
+                            args.render_size, args.render_size,
+                        )
+                        pred = model.renderer(
+                            model.decoder, v_codes[i],
+                            ro.to(device), rd.to(device),
+                        )
+                        gt = F.interpolate(
+                            v_target[i:i+1].permute(0, 3, 1, 2),
+                            (args.render_size, args.render_size),
+                            mode="bilinear", align_corners=False,
+                        ).permute(0, 2, 3, 1)[0]
+                        vl = vl + F.mse_loss(pred, gt)
+                    val_losses.append((vl / vB).item())
+            val_loss = sum(val_losses) / len(val_losses)
+            print(f"  val_loss={val_loss:.5f}", end="")
+            model.train()
+            model.renderer.eval()
+
+        print()  # newline after epoch summary line
+
+        # Save best adapter (use val loss if available, else train loss)
+        metric = val_loss if val_loss is not None else avg_loss
+        if metric < best_loss:
+            best_loss = metric
             lora_sd = get_lora_state_dict(model)
             torch.save(lora_sd, args.output)
             size_mb = os.path.getsize(args.output) / 1e6
-            print(f"  → Saved best adapter: {args.output} ({size_mb:.1f} MB)")
+            print(f"  ✓ Saved best adapter: {args.output} ({size_mb:.1f} MB)")
 
     # Final save regardless
     lora_sd = get_lora_state_dict(model)
@@ -399,6 +474,8 @@ def main():
                         help="LoRA rank")
     parser.add_argument("--lora_alpha", type=int, default=16,
                         help="LoRA alpha (scaling = alpha/r)")
+    parser.add_argument("--lora_dropout", type=float, default=0.0,
+                        help="Dropout on the LoRA path (0.0 = disabled)")
     args = parser.parse_args()
 
     train(args)
