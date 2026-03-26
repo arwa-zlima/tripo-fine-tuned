@@ -108,6 +108,7 @@ def split_and_process(input_dir, output_dir, val_ratio, use_rembg, image_size):
         import rembg
         rembg_session = rembg.new_session()
 
+    total_images = 0
     for split_name, split_objects in [("train", train_objects), ("val", val_objects)]:
         for obj_name in sorted(split_objects):
             src_dir = os.path.join(input_dir, obj_name)
@@ -119,9 +120,12 @@ def split_and_process(input_dir, output_dir, val_ratio, use_rembg, image_size):
                 if f.lower().endswith(".png")
             ])
 
+            if not image_files:
+                print(f"  [{split_name}] {obj_name}: WARNING — no PNG files found, skipping")
+                continue
+
             for img_file in image_files:
                 src_path = os.path.join(src_dir, img_file)
-                # Change extension to .png (output is always PNG)
                 dst_path = os.path.join(dst_dir, img_file)
 
                 if use_rembg:
@@ -130,9 +134,10 @@ def split_and_process(input_dir, output_dir, val_ratio, use_rembg, image_size):
                 else:
                     composite_on_white(src_path, dst_path, size=image_size)
 
+            total_images += len(image_files)
             print(f"  [{split_name}] {obj_name}: {len(image_files)} images")
 
-    print("Done.")
+    print(f"Done. Total images processed: {total_images}")
 
 
 def main():
